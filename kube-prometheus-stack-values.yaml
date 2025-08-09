@@ -1,0 +1,282 @@
+# kube-prometheus-stack-values.yaml
+
+## Global Configuration
+nameOverride: ""
+fullnameOverride: ""
+
+## CRDs installation
+crds:
+  enabled: true
+
+## Default Rules - Keep minimal for demo
+defaultRules:
+  create: true
+  rules:
+    alertmanager: true
+    etcd: false
+    configReloaders: true
+    general: true
+    k8sContainerResource: true
+    node: true
+    prometheus: true
+    prometheusOperator: true
+    kubernetesSystem: true
+    # Disable unnecessary rules for demo
+    kubeProxy: false
+    kubeStateMetrics: false
+    network: false
+    windows: false
+
+## AlertManager Configuration
+alertmanager:
+  enabled: true
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: 'web.hook'
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 1h
+    receivers:
+      - name: 'web.hook'
+        # Add your notification config here (Slack, email, etc.)
+
+  alertmanagerSpec:
+    replicas: 1
+    retention: 24h
+    resources:
+      requests:
+        memory: 128Mi
+        cpu: 100m
+      limits:
+        memory: 256Mi
+        cpu: 200m
+    
+    # EBS storage for persistence
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ebs-sc
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+
+## Grafana Configuration
+grafana:
+  enabled: true
+  
+  # Admin credentials
+  adminUser: admin
+  adminPassword: "admin123" 
+  
+  # Persistence
+  persistence:
+    enabled: true
+    type: pvc
+    storageClassName: ebs-sc
+    accessModes:
+      - ReadWriteOnce
+    size: 8Gi
+  
+  # Resources
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+  
+  # Data Sources
+  additionalDataSources:
+    - name: Tempo
+      type: tempo
+      url: http://tempo.monitoring.svc.cluster.local:3200
+      access: proxy
+      uid: tempo
+      isDefault: false
+  
+  # Sidecar for auto dashboard loading
+  sidecar:
+    dashboards:
+      enabled: true
+      label: grafana_dashboard
+      labelValue: "1"
+      searchNamespace: ALL
+      folderAnnotation: grafana_folder
+      provider:
+        foldersFromFilesStructure: true
+    
+    datasources:
+      enabled: true
+      defaultDatasourceEnabled: true
+      # Tempo integration for trace correlation
+      exemplarTraceIdDestinations:
+        tempo:
+          name: traceID
+          datasourceUid: tempo
+          url: http://tempo.monitoring.svc.cluster.local:3200
+  
+  # Dashboard Providers
+  dashboardProviders:
+    dashboardproviders.yaml:
+      apiVersion: 1
+      providers:
+        - name: 'observability-dashboards'
+          orgId: 1
+          folder: 'Observability'
+          type: file
+          disableDeletion: true
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards/observability-dashboards
+  
+  # Dashboards from GitHub Raw URLs
+  dashboards:
+    observability-dashboards:
+      microservice-observatory:
+        url: https://raw.githubusercontent.com/canogluonur/grafana-tempo-Observability/refs/heads/main/observability.json
+        token: ''
+
+## Prometheus Configuration
+prometheus:
+  enabled: true
+  
+  prometheusSpec:
+    # Resources
+    resources:
+      requests:
+        cpu: 250m
+        memory: 1Gi
+      limits:
+        cpu: 1000m
+        memory: 2Gi
+    
+    # Data retention
+    retention: 7d
+    retentionSize: "15GB"
+    
+    # Storage
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: ebs-sc
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 20Gi
+    
+    # Scrape configuration for OpenTelemetry
+    additionalScrapeConfigs: |
+
+      
+      # Auto-discover services with prometheus annotations
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            action: replace
+            target_label: kubernetes_namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            action: replace
+            target_label: kubernetes_pod_name
+
+## Component Configuration
+# API Server monitoring
+kubeApiServer:
+  enabled: true
+
+# Kubelet monitoring
+kubelet:
+  enabled: true
+  serviceMonitor:
+    cAdvisorMetricRelabelings:
+      # Drop less useful container metrics for demo
+      - sourceLabels: [__name__]
+        action: drop
+        regex: 'container_cpu_(cfs_throttled_seconds_total|load_average_10s|system_seconds_total|user_seconds_total)'
+
+# CoreDNS monitoring
+coreDns:
+  enabled: true
+
+# Controller Manager
+kubeControllerManager:
+  enabled: true
+
+# Scheduler
+kubeScheduler:
+  enabled: true
+
+# ETCD
+kubeEtcd:
+  enabled: true
+
+# Kube Proxy - disable for simplicity
+kubeProxy:
+  enabled: false
+
+## Node Exporter
+nodeExporter:
+  enabled: true
+
+prometheus-node-exporter:
+  resources:
+    requests:
+      memory: 64Mi
+      cpu: 50m
+    limits:
+      memory: 128Mi
+      cpu: 100m
+
+## Kube State Metrics
+kubeStateMetrics:
+  enabled: true
+
+kube-state-metrics:
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 100m
+    limits:
+      memory: 256Mi
+      cpu: 200m
+
+## Prometheus Operator
+prometheusOperator:
+  enabled: true
+  
+  # Resources
+  resources:
+    requests:
+      memory: 128Mi
+      cpu: 100m
+    limits:
+      memory: 256Mi
+      cpu: 200m
+  
+  # Admission webhooks
+  admissionWebhooks:
+    enabled: true
+    failurePolicy: Fail
+
+## Disable Thanos for simplicity
+thanosRuler:
+  enabled: false
