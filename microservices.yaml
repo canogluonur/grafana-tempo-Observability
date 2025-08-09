@@ -1,0 +1,884 @@
+# microservices.yaml
+# Bu dosya, User Service ve Order Service uygulamaları için gerekli tüm Kubernetes kaynaklarını içerir.
+# Bu kaynaklar arasında ConfigMap, Deployment, Service ve ServiceMonitor bulunur.
+
+---
+# =======================================================
+# Service 1: User Service
+# =======================================================
+
+# User Service Uygulama Kodunu ve Bağımlılıklarını İçeren ConfigMap
+# app.py: OpenTelemetry ve Prometheus client ile enstrümante edilmiş Python kodu.
+# requirements.txt: Uygulamanın Python bağımlılıkları.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: user-service-code
+  namespace: default
+data:
+  app.py: |
+    from flask import Flask, request, jsonify
+    import requests
+    import time
+    import random
+    import os
+    
+    # OpenTelemetry imports
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
+    from opentelemetry.instrumentation.flask import FlaskInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    
+    # Universal OpenTelemetry-compliant metrics
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    
+    # Flask app
+    app = Flask(__name__)
+    
+    # Universal HTTP metrics
+    HTTP_REQUESTS_TOTAL = Counter(
+        'http_requests_total',
+        'Total HTTP requests',
+        ['service_name', 'http_route', 'http_method', 'http_status_code']
+    )
+    
+    HTTP_REQUEST_DURATION = Histogram(
+        'http_request_duration_seconds',
+        'HTTP request duration in seconds',
+        ['service_name', 'http_route', 'http_method'],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    
+    HTTP_REQUESTS_ACTIVE = Gauge(
+        'http_requests_active',
+        'Active HTTP requests',
+        ['service_name']
+    )
+    
+    SERVICE_INFO = Gauge(
+        'service_info',
+        'Service information',
+        ['service_name', 'service_version']
+    )
+    
+    # Service-to-service call metrics
+    DOWNSTREAM_CALLS = Counter(
+        'http_client_requests_total',
+        'Total downstream HTTP requests',
+        ['service_name', 'target_service', 'http_method', 'http_status_code']
+    )
+    
+    DOWNSTREAM_DURATION = Histogram(
+        'http_client_request_duration_seconds',
+        'Duration of downstream HTTP requests',
+        ['service_name', 'target_service', 'http_method'],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    
+    # Setup OpenTelemetry
+    resource = Resource.create({
+        SERVICE_NAME: os.getenv("OTEL_SERVICE_NAME", "user-service"),
+        SERVICE_VERSION: "1.0.0",
+        "deployment.environment": "production",
+        "service.namespace": "default",
+        "k8s.cluster.name": os.getenv("CLUSTER_NAME", "default-cluster")
+    })
+    
+    trace.set_tracer_provider(TracerProvider(resource=resource))
+    tracer = trace.get_tracer(__name__)
+    
+    # OTLP Exporter
+    otlp_exporter = OTLPSpanExporter(
+        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318") + "/v1/traces"
+    )
+    
+    span_processor = BatchSpanProcessor(otlp_exporter)
+    trace.get_tracer_provider().add_span_processor(span_processor)
+    
+    # Set service info
+    SERVICE_INFO.labels(
+        service_name=os.getenv("OTEL_SERVICE_NAME", "user-service"),
+        service_version="1.0.0"
+    ).set(1)
+    
+    # Auto-instrumentation
+    FlaskInstrumentor().instrument_app(app)
+    RequestsInstrumentor().instrument()
+    
+    # Universal middleware
+    @app.before_request
+    def before_request():
+        request.start_time = time.time()
+        HTTP_REQUESTS_ACTIVE.labels(
+            service_name=os.getenv("OTEL_SERVICE_NAME", "user-service")
+        ).inc()
+    
+    @app.after_request
+    def after_request(response):
+        request_duration = time.time() - request.start_time
+        service_name = os.getenv("OTEL_SERVICE_NAME", "user-service")
+        http_route = request.endpoint or request.path
+        
+        # Normalize route
+        if request.endpoint:
+            if 'user_id' in request.view_args or False:
+                http_route = '/api/users/{id}'
+            elif request.endpoint == 'get_users':
+                http_route = '/api/users'
+            elif request.endpoint == 'get_user_profile':
+                http_route = '/api/users/{id}/profile'
+            elif request.endpoint == 'home':
+                http_route = '/'
+            elif request.endpoint == 'health':
+                http_route = '/health'
+            elif request.endpoint == 'metrics_endpoint':
+                http_route = '/metrics'
+        
+        HTTP_REQUESTS_TOTAL.labels(
+            service_name=service_name,
+            http_route=http_route,
+            http_method=request.method,
+            http_status_code=str(response.status_code)
+        ).inc()
+        
+        HTTP_REQUEST_DURATION.labels(
+            service_name=service_name,
+            http_route=http_route,
+            http_method=request.method
+        ).observe(request_duration)
+        
+        HTTP_REQUESTS_ACTIVE.labels(
+            service_name=service_name
+        ).dec()
+        
+        return response
+    
+    def call_downstream_service(target_service, endpoint, method='GET', **kwargs):
+        """Helper for downstream service calls with metrics"""
+        service_name = os.getenv("OTEL_SERVICE_NAME", "user-service")
+        start_time = time.time()
+        
+        try:
+            with tracer.start_as_current_span(f"call_{target_service}") as span:
+                span.set_attributes({
+                    "http.method": method,
+                    "http.url": endpoint,
+                    "service.name": target_service,
+                    "rpc.service": target_service
+                })
+                
+                if method == 'GET':
+                    response = requests.get(endpoint, timeout=5, **kwargs)
+                elif method == 'POST':
+                    response = requests.post(endpoint, timeout=5, **kwargs)
+                
+                duration = time.time() - start_time
+                
+                # Record downstream metrics
+                DOWNSTREAM_CALLS.labels(
+                    service_name=service_name,
+                    target_service=target_service,
+                    http_method=method,
+                    http_status_code=str(response.status_code)
+                ).inc()
+                
+                DOWNSTREAM_DURATION.labels(
+                    service_name=service_name,
+                    target_service=target_service,
+                    http_method=method
+                ).observe(duration)
+                
+                span.set_attributes({
+                    "http.status_code": response.status_code,
+                    "http.response_size": len(response.content)
+                })
+                
+                if response.status_code >= 400:
+                    span.set_status(trace.Status(trace.StatusCode.ERROR, f"HTTP {response.status_code}"))
+                
+                return response
+                
+        except Exception as e:
+            duration = time.time() - start_time
+            DOWNSTREAM_CALLS.labels(
+                service_name=service_name,
+                target_service=target_service,
+                http_method=method,
+                http_status_code="0"  # Connection error
+            ).inc()
+            
+            DOWNSTREAM_DURATION.labels(
+                service_name=service_name,
+                target_service=target_service,
+                http_method=method
+            ).observe(duration)
+            
+            raise e
+    
+    @app.route('/')
+    def home():
+        return jsonify({
+            "service": "user-service",
+            "message": "User Service is running!",
+            "version": "1.0.0"
+        })
+    
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "healthy", "service": "user-service"})
+    
+    @app.route('/api/users')
+    def get_users():
+        with tracer.start_as_current_span("GET /api/users") as span:
+            # 10% chance of 500 error for testing
+            if random.random() < 0.1:
+                span.set_status(trace.Status(trace.StatusCode.ERROR, "Database connection failed"))
+                return jsonify({"error": "Database connection failed"}), 500
+            
+            # Simulate database call
+            time.sleep(random.uniform(0.1, 0.3))
+            
+            users = [
+                {"id": 1, "name": "Alice", "email": "alice@example.com"},
+                {"id": 2, "name": "Bob", "email": "bob@example.com"},
+                {"id": 3, "name": "Charlie", "email": "charlie@example.com"}
+            ]
+            
+            span.set_attributes({"users.count": len(users)})
+            return jsonify({"users": users})
+    
+    @app.route('/api/users/<int:user_id>')
+    def get_user(user_id):
+        with tracer.start_as_current_span("GET /api/users/{id}") as span:
+            span.set_attributes({"user.id": user_id})
+            
+            time.sleep(random.uniform(0.05, 0.15))
+            
+            if user_id > 10:
+                span.set_status(trace.Status(trace.StatusCode.ERROR, "User not found"))
+                return jsonify({"error": "User not found"}), 404
+            
+            user = {"id": user_id, "name": f"User {user_id}", "email": f"@example.com">user{user_id}@example.com"}
+            return jsonify({"user": user})
+    
+    @app.route('/api/users/<int:user_id>/profile')
+    def get_user_profile(user_id):
+        """Get user profile - calls order service to get user's orders"""
+        with tracer.start_as_current_span("GET /api/users/{id}/profile") as span:
+            span.set_attributes({"user.id": user_id})
+            
+            if user_id > 10:
+                return jsonify({"error": "User not found"}), 404
+            
+            # Get basic user info
+            user = {"id": user_id, "name": f"User {user_id}", "email": f"@example.com">user{user_id}@example.com"}
+            
+            try:
+                # Call order service to get user's orders
+                order_service_url = "http://order-service.default.svc.cluster.local/api/orders/user/" + str(user_id)
+                response = call_downstream_service("order-service", order_service_url)
+                
+                if response.status_code == 200:
+                    orders = response.json().get("orders", [])
+                    user["orders"] = orders
+                    user["order_count"] = len(orders)
+                else:
+                    user["orders"] = []
+                    user["order_count"] = 0
+                    span.set_attributes({"order_service.error": True})
+                    
+            except Exception as e:
+                # Handle service unavailable
+                user["orders"] = []
+                user["order_count"] = 0
+                user["error"] = "Order service unavailable"
+                span.set_attributes({"order_service.unavailable": True})
+            
+            return jsonify({"profile": user})
+    
+    @app.route('/api/test-error')
+    def test_error():
+        return jsonify({"error": "Test error from user service"}), 500
+    
+    @app.route('/api/test-slow')
+    def test_slow():
+        sleep_time = random.uniform(2, 5)
+        time.sleep(sleep_time)
+        return jsonify({"message": f"Slow response from user service: {sleep_time:.2f}s"})
+
+    @app.route('/metrics')
+    def metrics_endpoint():
+        return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=5000)
+
+  requirements.txt: |
+    Flask==3.0.0
+    requests==2.31.0
+    opentelemetry-api==1.21.0
+    opentelemetry-sdk==1.21.0
+    opentelemetry-exporter-otlp==1.21.0
+    opentelemetry-instrumentation-flask==0.42b0
+    opentelemetry-instrumentation-requests==0.42b0
+    prometheus-client==0.19.0
+
+---
+# User Service Deployment
+# prometheus.io/scrape annotations ile metrikleri Prometheus'a açar.
+# OTEL_EXPORTER_OTLP_ENDPOINT ortam değişkeni ile trace'leri Tempo'ya gönderir.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: default
+  labels:
+    app: user-service
+    service: user-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+        service: user-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      initContainers:
+      - name: install-deps
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            cd /app
+            pip install --no-cache-dir -r requirements.txt
+            cp -r /usr/local/lib/python3.11/site-packages/* /shared-packages/
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: shared-packages
+          mountPath: /shared-packages
+      containers:
+      - name: user-service
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            export PYTHONPATH="/shared-packages:$PYTHONPATH"
+            cd /app
+            python app.py
+        ports:
+        - containerPort: 5000
+        env:
+        - name: OTEL_SERVICE_NAME
+          value: "user-service"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://tempo.monitoring.svc.cluster.local:4318"
+        - name: CLUSTER_NAME
+          value: "default-cluster"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: shared-packages
+          mountPath: /shared-packages
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      volumes:
+      - name: app-code
+        configMap:
+          name: user-service-code
+      - name: shared-packages
+        emptyDir: {}
+
+---
+# User Service
+# ClusterIP tipi ile diğer servislerin ve Prometheus'un erişebileceği dahili bir DNS adı sağlar.
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: default
+  labels:
+    app: user-service
+    service: user-service
+spec:
+  selector:
+    app: user-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 5000
+  type: ClusterIP
+
+---
+# User Service Monitor
+# Prometheus Operator'a bu servisin metriklerini scrape etmesi gerektiğini bildirir.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: user-service
+  namespace: default
+  labels:
+    app: user-service
+    service: user-service
+    release: prometheus # Prometheus'un bu ServiceMonitor'ı keşfetmesi için gerekli etiket.
+spec:
+  selector:
+    matchLabels:
+      app: user-service
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
+
+---
+# =======================================================
+# Service 2: Order Service
+# =======================================================
+
+# Order Service Uygulama Kodunu ve Bağımlılıklarını İçeren ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: order-service-code
+  namespace: default
+data:
+  app.py: |
+    from flask import Flask, request, jsonify
+    import requests
+    import time
+    import random
+    import os
+    
+    # OpenTelemetry imports
+    from opentelemetry import trace
+    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import BatchSpanProcessor
+    from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
+    from opentelemetry.instrumentation.flask import FlaskInstrumentor
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    
+    # Universal OpenTelemetry-compliant metrics
+    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    
+    # Flask app
+    app = Flask(__name__)
+    
+    # Universal HTTP metrics
+    HTTP_REQUESTS_TOTAL = Counter(
+        'http_requests_total',
+        'Total HTTP requests',
+        ['service_name', 'http_route', 'http_method', 'http_status_code']
+    )
+    
+    HTTP_REQUEST_DURATION = Histogram(
+        'http_request_duration_seconds',
+        'HTTP request duration in seconds',
+        ['service_name', 'http_route', 'http_method'],
+        buckets=[0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
+    )
+    
+    HTTP_REQUESTS_ACTIVE = Gauge(
+        'http_requests_active',
+        'Active HTTP requests',
+        ['service_name']
+    )
+    
+    SERVICE_INFO = Gauge(
+        'service_info',
+        'Service information',
+        ['service_name', 'service_version']
+    )
+    
+    # Business metrics
+    ORDERS_CREATED = Counter(
+        'orders_created_total',
+        'Total orders created',
+        ['service_name', 'status']
+    )
+    
+    ORDER_VALUE = Histogram(
+        'order_value_dollars',
+        'Order value in dollars',
+        ['service_name'],
+        buckets=[10, 25, 50, 100, 250, 500, 1000]
+    )
+    
+    # Setup OpenTelemetry
+    resource = Resource.create({
+        SERVICE_NAME: os.getenv("OTEL_SERVICE_NAME", "order-service"),
+        SERVICE_VERSION: "1.0.0",
+        "deployment.environment": "production",
+        "service.namespace": "default",
+        "k8s.cluster.name": os.getenv("CLUSTER_NAME", "default-cluster")
+    })
+    
+    trace.set_tracer_provider(TracerProvider(resource=resource))
+    tracer = trace.get_tracer(__name__)
+    
+    # OTLP Exporter
+    otlp_exporter = OTLPSpanExporter(
+        endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318") + "/v1/traces"
+    )
+    
+    span_processor = BatchSpanProcessor(otlp_exporter)
+    trace.get_tracer_provider().add_span_processor(span_processor)
+    
+    # Set service info
+    SERVICE_INFO.labels(
+        service_name=os.getenv("OTEL_SERVICE_NAME", "order-service"),
+        service_version="1.0.0"
+    ).set(1)
+    
+    # Auto-instrumentation
+    FlaskInstrumentor().instrument_app(app)
+    RequestsInstrumentor().instrument()
+    
+    # In-memory orders store (for demo)
+    orders_db = {}
+    order_counter = 1
+    
+    # Universal middleware
+    @app.before_request
+    def before_request():
+        request.start_time = time.time()
+        HTTP_REQUESTS_ACTIVE.labels(
+            service_name=os.getenv("OTEL_SERVICE_NAME", "order-service")
+        ).inc()
+    
+    @app.after_request
+    def after_request(response):
+        request_duration = time.time() - request.start_time
+        service_name = os.getenv("OTEL_SERVICE_NAME", "order-service")
+        http_route = request.endpoint or request.path
+        
+        # Normalize route
+        if request.endpoint:
+            if 'user_id' in request.view_args:
+                http_route = '/api/orders/user/{id}'
+            elif 'order_id' in request.view_args:
+                http_route = '/api/orders/{id}'
+            elif request.endpoint == 'create_order':
+                http_route = '/api/orders'
+            elif request.endpoint == 'get_orders':
+                http_route = '/api/orders'
+            elif request.endpoint == 'home':
+                http_route = '/'
+            elif request.endpoint == 'health':
+                http_route = '/health'
+            elif request.endpoint == 'metrics_endpoint':
+                http_route = '/metrics'
+        
+        HTTP_REQUESTS_TOTAL.labels(
+            service_name=service_name,
+            http_route=http_route,
+            http_method=request.method,
+            http_status_code=str(response.status_code)
+        ).inc()
+        
+        HTTP_REQUEST_DURATION.labels(
+            service_name=service_name,
+            http_route=http_route,
+            http_method=request.method
+        ).observe(request_duration)
+        
+        HTTP_REQUESTS_ACTIVE.labels(
+            service_name=service_name
+        ).dec()
+        
+        return response
+    
+    @app.route('/')
+    def home():
+        return jsonify({
+            "service": "order-service",
+            "message": "Order Service is running!",
+            "version": "1.0.0",
+            "total_orders": len(orders_db)
+        })
+    
+    @app.route('/health')
+    def health():
+        return jsonify({"status": "healthy", "service": "order-service"})
+    
+    @app.route('/api/orders', methods=['GET'])
+    def get_orders():
+        with tracer.start_as_current_span("GET /api/orders") as span:
+            # Simulate database query
+            time.sleep(random.uniform(0.05, 0.15))
+            
+            orders = list(orders_db.values())
+            span.set_attributes({"orders.count": len(orders)})
+            
+            return jsonify({"orders": orders})
+    
+    @app.route('/api/orders', methods=['POST'])
+    def create_order():
+        global order_counter
+        
+        with tracer.start_as_current_span("POST /api/orders") as span:
+            data = request.get_json() or {}
+            user_id = data.get('user_id')
+            product_id = data.get('product_id')
+            quantity = data.get('quantity', 1)
+            
+            if not user_id or not product_id:
+                ORDERS_CREATED.labels(
+                    service_name=os.getenv("OTEL_SERVICE_NAME", "order-service"),
+                    status="failed"
+                ).inc()
+                return jsonify({"error": "Missing required fields"}), 400
+            
+            # 5% chance of 500 error
+            if random.random() < 0.05:
+                ORDERS_CREATED.labels(
+                    service_name=os.getenv("OTEL_SERVICE_NAME", "order-service"),
+                    status="failed"
+                ).inc()
+                span.set_status(trace.Status(trace.StatusCode.ERROR, "Payment processing failed"))
+                return jsonify({"error": "Payment processing failed"}), 500
+            
+            # Simulate payment processing
+            with tracer.start_as_current_span("process_payment") as payment_span:
+                payment_span.set_attributes({
+                    "payment.user_id": user_id,
+                    "payment.amount": quantity * 50  # $50 per item
+                })
+                time.sleep(random.uniform(0.1, 0.4))
+            
+            # Simulate database insert
+            with tracer.start_as_current_span("database_insert") as db_span:
+                db_span.set_attributes({
+                    "db.system": "postgresql",
+                    "db.table": "orders"
+                })
+                time.sleep(random.uniform(0.02, 0.1))
+            
+            order_id = f"order_{order_counter}"
+            order_counter += 1
+            value = quantity * 50
+            
+            order = {
+                "order_id": order_id,
+                "user_id": user_id,
+                "product_id": product_id,
+                "quantity": quantity,
+                "value": value,
+                "status": "completed",
+                "created_at": int(time.time())
+            }
+            
+            orders_db[order_id] = order
+            
+            # Record business metrics
+            ORDERS_CREATED.labels(
+                service_name=os.getenv("OTEL_SERVICE_NAME", "order-service"),
+                status="success"
+            ).inc()
+            
+            ORDER_VALUE.labels(
+                service_name=os.getenv("OTEL_SERVICE_NAME", "order-service")
+            ).observe(value)
+            
+            span.set_attributes({
+                "order.id": order_id,
+                "order.value": value,
+                "order.status": "completed"
+            })
+            
+            return jsonify({"order": order}), 201
+    
+    @app.route('/api/orders/user/<int:user_id>')
+    def get_user_orders(user_id):
+        with tracer.start_as_current_span("GET /api/orders/user/{id}") as span:
+            span.set_attributes({"user.id": user_id})
+            
+            # Simulate database query
+            time.sleep(random.uniform(0.05, 0.2))
+            
+            # Filter orders by user_id
+            user_orders = [order for order in orders_db.values() if order["user_id"] == user_id]
+            
+            span.set_attributes({"orders.count": len(user_orders)})
+            
+            return jsonify({"orders": user_orders, "user_id": user_id})
+    
+    @app.route('/api/orders/<order_id>')
+    def get_order(order_id):
+        with tracer.start_as_current_span("GET /api/orders/{id}") as span:
+            span.set_attributes({"order.id": order_id})
+            
+            time.sleep(random.uniform(0.02, 0.08))
+            
+            order = orders_db.get(order_id)
+            if not order:
+                return jsonify({"error": "Order not found"}), 404
+            
+            return jsonify({"order": order})
+    
+    @app.route('/api/test-error')
+    def test_error():
+        return jsonify({"error": "Test error from order service"}), 500
+    
+    @app.route('/api/test-slow')
+    def test_slow():
+        sleep_time = random.uniform(3, 7)
+        time.sleep(sleep_time)
+        return jsonify({"message": f"Slow response from order service: {sleep_time:.2f}s"})
+
+    @app.route('/metrics')
+    def metrics_endpoint():
+        return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
+    
+    if __name__ == '__main__':
+        app.run(host='0.0.0.0', port=5000)
+
+  requirements.txt: |
+    Flask==3.0.0
+    requests==2.31.0
+    opentelemetry-api==1.21.0
+    opentelemetry-sdk==1.21.0
+    opentelemetry-exporter-otlp==1.21.0
+    opentelemetry-instrumentation-flask==0.42b0
+    opentelemetry-instrumentation-requests==0.42b0
+    prometheus-client==0.19.0
+
+---
+# Order Service Deployment
+# prometheus.io/scrape annotations ile metrikleri Prometheus'a açar.
+# OTEL_EXPORTER_OTLP_ENDPOINT ortam değişkeni ile trace'leri Tempo'ya gönderir.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: default
+  labels:
+    app: order-service
+    service: order-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+        service: order-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "5000"
+        prometheus.io/path: "/metrics"
+    spec:
+      initContainers:
+      - name: install-deps
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            cd /app
+            pip install --no-cache-dir -r requirements.txt
+            cp -r /usr/local/lib/python3.11/site-packages/* /shared-packages/
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: shared-packages
+          mountPath: /shared-packages
+      containers:
+      - name: order-service
+        image: python:3.11-slim
+        command: ["/bin/bash", "-c"]
+        args:
+          - |
+            export PYTHONPATH="/shared-packages:$PYTHONPATH"
+            cd /app
+            python app.py
+        ports:
+        - containerPort: 5000
+        env:
+        - name: OTEL_SERVICE_NAME
+          value: "order-service"
+        - name: OTEL_EXPORTER_OTLP_ENDPOINT
+          value: "http://tempo.monitoring.svc.cluster.local:4318"
+        - name: CLUSTER_NAME
+          value: "default-cluster"
+        - name: PYTHONUNBUFFERED
+          value: "1"
+        volumeMounts:
+        - name: app-code
+          mountPath: /app
+        - name: shared-packages
+          mountPath: /shared-packages
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+      volumes:
+      - name: app-code
+        configMap:
+          name: order-service-code
+      - name: shared-packages
+        emptyDir: {}
+
+---
+# Order Service
+# ClusterIP tipi ile diğer servislerin ve Prometheus'un erişebileceği dahili bir DNS adı sağlar.
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: default
+  labels:
+    app: order-service
+    service: order-service
+spec:
+  selector:
+    app: order-service
+  ports:
+  - name: http
+    port: 80
+    targetPort: 5000
+  type: ClusterIP
+
+---
+# Order Service Monitor
+# Prometheus Operator'a bu servisin metriklerini scrape etmesi gerektiğini bildirir.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: order-service
+  namespace: default
+  labels:
+    app: order-service
+    service: order-service
+    release: prometheus # Prometheus'un bu ServiceMonitor'ı keşfetmesi için gerekli etiket.
+spec:
+  selector:
+    matchLabels:
+      app: order-service
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 15s
+    scrapeTimeout: 10s
