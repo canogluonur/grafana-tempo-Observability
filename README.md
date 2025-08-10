@@ -9,3 +9,8 @@ Grafana Tempo Single Binary Mode
 * <https://github.com/grafana/tempo>
 
 ----
+
+<img width="1600" height="832" alt="image" src="https://github.com/user-attachments/assets/93ee44c2-0ba4-48aa-8536-6288de99ab9a" />
+
+
+<img width="1600" height="751" alt="image" src="https://github.com/user-attachments/assets/e9846ceb-7150-417d-853e-6564a3ef6800" />
